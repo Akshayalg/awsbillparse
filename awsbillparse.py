@@ -1,6 +1,13 @@
 import sys
 import pandas as pd
 import gzip
+from __future__ import print_function
+import boto3
+import os
+import uuid
+import json
+import zipfile
+import io
 
 
 def awsbill_convert_new_to_old(src_file, dest_file):
@@ -37,3 +44,52 @@ def awsbill_convert_new_to_old(src_file, dest_file):
                       'BlendedCost', 'UnBlendedRate', 'UnBlendedCost', 'ResourceId']
     csv_data.to_csv(dest_file, encoding='utf-8', index=False, compression='gzip')
 
+
+def bill_split_json(input_path):
+
+    #Reading the config json file
+    with open(input_path) as f:
+        data = json.load(f)
+
+
+    #Retrieve the input csv file to parse 
+    download_path = '/tmp/{}{}'.format(uuid.uuid4(), data["fileName"])
+    s3_client.download_file(data["source"], data["fileName"], download_path)
+
+    cols = pd.DataFrame()
+
+    #Check whether the input file is zip file or not
+    fname_list = data["fileName"].split(".")
+    if "zip" in fname_list:
+        zip_name = zipfile.ZipFile(download_path, 'r')
+        csv_file = fname_list[0]+".csv"
+        zp = zip_name.open(csv_file)
+        
+        #Dividing the dataframes into chunks
+        csv_data = pd.read_csv(zp, iterator=True, chunksize=1000)
+        for df in csv_data:
+            for i in data["splits"][0]["accounts"]:
+                cols = cols.append(df.loc[df['SubscriptionId'] == int(i["id"])])
+
+    else:
+        csv_file = data["fileName"]
+        csv_data = pd.read_csv(download_path)
+        for i in data["splits"][0]["accounts"]:
+            cols = cols.append(csv_data.loc[csv_data['SubscriptionId'] == int(i["id"])])
+
+    zip_file = csv_file+'.zip'
+    upload_path = '/tmp/{}{}'.format(uuid.uuid4(), zip_file)
+    csv_path = '/tmp/{}'.format( csv_file)
+
+    os.chdir('/tmp')
+    #Insert the parsed values to the output csv file
+    cols.to_csv(csv_path, index = False)
+
+    #Zip the csv file 
+    with zipfile.ZipFile(upload_path, 'w') as zp:
+        zp.write(csv_file)
+
+    #upload the output zip file to the destination bucket
+    s3_client.upload_file(upload_path, data["splits"][0]["destinationBucket"],'{}-filtered'.format(zip_file))
+    os.remove(download_path)
+    os.remove(upload_path)
